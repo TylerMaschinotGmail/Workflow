@@ -410,6 +410,11 @@ const blankItem = () => ({
   specialHandling: "",
   specialStoring: "",
   expectedDeparture: "",
+  // ── Phase 0: pricing mode + variable monthly inventory ──
+  pricingMode: "dimensional", // "dimensional" = L×W×H footprint × rate; "flat" = direct $/unit/mo
+  flatRate: "",               // COGS $ per unit per month (flat mode only). A COST — Finance applies margin.
+  movementSchedule: null,     // null = simple model (full qty in at arrival, out at departure).
+                              // detailed = [{ month:"YYYY-MM", label, inbound, outbound, billableOverride, modified }]
 });
 
 const STANDARD_HALO_PCT = 20;  // system-wide default when CSR hasn't specified a per-item halo
@@ -420,6 +425,33 @@ const blankHandling = () => ({
   rate: "",
   unit: "per_unit",     // "per_unit" = per pallet/item, "per_shipment" = per truckload
   isPrimary: false,     // explicit flag — normalized on save/render so exactly one per equipment group
+});
+
+// ── Phase 0: specialty (cost-plus) handling ──
+// A specialty builder is COGS entered by Procurement, assigned to one or more items,
+// carrying its OWN margin (defaults to the project/global margin). Because it has its own
+// margin it is EXCLUDED from the global-margin base — never double-marked-up.
+// Display is purely cosmetic: "consolidated" shows one line at the full marked-up total;
+// "itemized" shows each piece at its marked-up share. The customer total is identical either
+// way, and COGS is never shown to the customer.
+const blankSpecialtyLine = () => ({
+  id: genRowId(),
+  label: "",          // free text — "Crane", "150-ton crane", "rigging crew", "per diem"… never hardcoded
+  cost: "",           // COGS per occurrence (a cost, not a price)
+  times: "1",         // how many times charged (e.g. crane mobilized in + out = 2)
+  note: "",           // operational caveat; flows to quote disclaimers (Finance/Admin may edit/remove)
+  noteToQuote: true,  // include this line's note in the customer quote disclaimers by default
+});
+
+const blankSpecialtyBuilder = () => ({
+  id: genRowId(),
+  name: "",                 // customer-facing label when consolidated (e.g. "Crane Handling")
+  itemIds: [],              // freight this specialty handling covers; switches OFF standard handling for them
+  direction: "both",        // "inbound" | "outbound" | "both" — informational/labeling
+  lines: [blankSpecialtyLine()],
+  marginPct: null,          // null = inherit project/global margin; number = explicit override (0 = comped)
+  display: "consolidated",  // "consolidated" (one line) | "itemized" (broken out) — never changes the total
+  createdBy: "",
 });
 
 const blankRequest = () => ({
@@ -476,6 +508,7 @@ const blankRequest = () => ({
   touchLog: [],
   changeLog: [],
   sharedNotes: [],
+  specialtyHandling: [],   // Phase 0: cost-plus specialty handling builders (Procurement builds COGS, Finance margins)
 });
 
 // ============================================================
@@ -6199,6 +6232,179 @@ function RequestDetail({ request: rawRequest, role, onBack, onUpdate, onDelete, 
 // ============================================================
 // FINANCE QUOTE BUILDER
 // ============================================================
+
+// ============================================================
+// PHASE 0 — VARIABLE-INVENTORY BILLING ENGINE
+// Additive + dormant. buildStorageSchedule (V1, below) is UNCHANGED and still drives
+// the current UI. These peer functions reproduce V1's numbers for simple dimensional
+// items and extend to drawdown schedules + flat-rate items. Wired into the Finance
+// builder / PDF in Phase 3.
+// ============================================================
+
+// Numeric coercion that treats blanks/garbage as 0.
+const sNum = (x) => { const v = parseFloat(x); return isNaN(v) ? 0 : v; };
+
+// Inclusive month range between two dates — mirrors V1's iteration exactly (noon anchor,
+// year<2000 guard) so the two paths stay consistent.
+function monthRangeKeys(startDate, endDate) {
+  if (!startDate || !endDate) return [];
+  const a = new Date(startDate + "T12:00:00");
+  const b = new Date(endDate + "T12:00:00");
+  if (isNaN(a.getTime()) || isNaN(b.getTime())) return [];
+  if (a.getFullYear() < 2000 || b.getFullYear() < 2000) return [];
+  const out = [];
+  const cur = new Date(a.getFullYear(), a.getMonth(), 1);
+  const end = new Date(b.getFullYear(), b.getMonth(), 1);
+  while (cur <= end) {
+    out.push({
+      key: `${cur.getFullYear()}-${String(cur.getMonth() + 1).padStart(2, "0")}`,
+      label: cur.toLocaleDateString("en-US", { month: "long", year: "numeric" }),
+      sort: cur.getTime(),
+    });
+    cur.setMonth(cur.getMonth() + 1);
+  }
+  return out;
+}
+
+// Label/sort for a "YYYY-MM" key.
+function monthMeta(key) {
+  const [y, m] = String(key).split("-").map(Number);
+  const d = new Date(y, (m || 1) - 1, 1);
+  return { label: d.toLocaleDateString("en-US", { month: "long", year: "numeric" }), sort: d.getTime() };
+}
+
+// Ordered per-month movement rows for an item.
+//  - Detailed: item.movementSchedule (CSR-entered in/out + optional finance override).
+//  - Simple (schedule null/empty): full qty in at the arrival month, out at the departure
+//    month — which makes the engine bill full qty EVERY month, matching today's behavior.
+function itemMovementMonths(item) {
+  const sched = item && Array.isArray(item.movementSchedule) ? item.movementSchedule : null;
+  if (sched && sched.length) {
+    return sched.map(r => {
+      const meta = monthMeta(r.month);
+      return {
+        key: r.month, label: r.label || meta.label, sort: meta.sort,
+        inbound: sNum(r.inbound), outbound: sNum(r.outbound),
+        billableOverride: (r.billableOverride != null && r.billableOverride !== "") ? r.billableOverride : null,
+        modified: !!r.modified,
+      };
+    }).sort((x, y) => x.sort - y.sort);
+  }
+  const months = monthRangeKeys(item && item.arrivalDate, item && item.expectedDeparture);
+  if (!months.length) return [];
+  const qty = sNum(item && item.quantity);
+  return months.map((m, i) => ({
+    key: m.key, label: m.label, sort: m.sort,
+    inbound: i === 0 ? qty : 0,
+    outbound: i === months.length - 1 ? qty : 0,
+    billableOverride: null, modified: false,
+  }));
+}
+
+// THE billing rule (validated against the 30/40/40 walkthrough): peak (startOnHand+inbound,
+// departures ignored) for first & last month; net end-of-month for middle months; true net
+// carried forward; a finance override replaces the BILLED number but never the carry math.
+function computeItemBilling(months) {
+  const n = months.length;
+  let onHand = 0;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const inb = sNum(months[i].inbound);
+    const outb = sNum(months[i].outbound);
+    const start = onHand;
+    const end = start + inb - outb;
+    const isEdge = (i === 0 || i === n - 1);
+    let computed = isEdge ? (start + inb) : end;
+    if (computed < 0) computed = 0;
+    const ov = months[i].billableOverride;
+    const hasOv = ov != null && ov !== "";
+    out.push({
+      key: months[i].key, label: months[i].label, sort: months[i].sort,
+      startOnHand: start, endOnHand: end, inbound: inb, outbound: outb,
+      computedBillable: computed, billable: hasOv ? sNum(ov) : computed, overridden: hasOv,
+    });
+    onHand = end;
+  }
+  return out;
+}
+
+// Per-item billable-units timeline, tagged with the item's storage type ("either" -> indoor, as V1).
+function itemBillableByMonth(item) {
+  const type = (item && item.storageType === "outdoor") ? "outdoor" : "indoor";
+  return computeItemBilling(itemMovementMonths(item)).map(m => ({ ...m, storageType: type }));
+}
+
+// Halo-adjusted footprint of one unit (ft²) for a dimensional item.
+function perUnitHaloSqft(item, haloPct) {
+  const mult = 1 + sNum(haloPct) / 100;
+  return (sNum(item.dimL) * mult) * (sNum(item.dimW) * mult) / 144;
+}
+
+// V2 storage schedule: simple + detailed, dimensional + flat, split by type. Rows carry BOTH
+// sqft (dimensional, billed at the per-type rate) and flatCost (flat items, a direct COGS).
+// For a quote of only simple dimensional items, sqft/month is identical to V1.
+// Phase 3 storageCost = Σ sqft×rate + Σ flatCost.
+function buildStorageScheduleV2(items, globalHalo = 0, itemHalos = {}) {
+  const buckets = { indoor: {}, outdoor: {} };
+  (items || []).forEach(item => {
+    const flat = item && item.pricingMode === "flat";
+    const haloPct = (itemHalos && itemHalos[item.id] != null) ? itemHalos[item.id] : globalHalo;
+    const fpPerUnit = flat ? 0 : perUnitHaloSqft(item, haloPct);
+    const flatRate = sNum(item && item.flatRate);
+    itemBillableByMonth(item).forEach(m => {
+      const b = buckets[m.storageType];
+      if (!b[m.key]) b[m.key] = { key: m.key, label: m.label, sort: m.sort, sqft: 0, flatCost: 0, storageType: m.storageType };
+      if (flat) b[m.key].flatCost += m.billable * flatRate;
+      else      b[m.key].sqft     += Math.ceil(fpPerUnit * m.billable);
+    });
+  });
+  const toRows = (bk) => Object.values(bk).sort((a, b) => a.sort - b.sort).map(m => ({ ...m, sqft: Math.ceil(m.sqft) }));
+  const indoorRows = toRows(buckets.indoor);
+  const outdoorRows = toRows(buckets.outdoor);
+  if (outdoorRows.length === 0) return indoorRows;
+  if (indoorRows.length === 0) return outdoorRows;
+  return [...indoorRows, ...outdoorRows].sort((a, b) => a.sort - b.sort || (a.storageType === "indoor" ? -1 : 1));
+}
+
+// Per-month handling events for an item in a direction (qty moved that month). Phase 1/3 price
+// these against procurement rates — one billable handling instance per month with movement.
+function itemHandlingEvents(item, direction) {
+  return itemBillableByMonth(item)
+    .map(m => ({ key: m.key, label: m.label, sort: m.sort, qty: direction === "inbound" ? m.inbound : m.outbound }))
+    .filter(e => e.qty > 0);
+}
+
+// Is this item covered by any specialty-handling builder? (If so, standard handling is suppressed.)
+function itemUsesSpecialty(itemId, specialtyHandling) {
+  return (specialtyHandling || []).some(b => Array.isArray(b.itemIds) && b.itemIds.includes(itemId));
+}
+
+// ── Margin-ledger atom: COGS in, margin applied, customer price out ──
+// The persisted ledger (Phase 3) records {cogs, marginPct, price} per element + a project rollup,
+// so every quote is auditable. Never shown to the customer.
+function priceFromCogs(cogs, marginPct) {
+  const c = sNum(cogs), m = sNum(marginPct);
+  return { cogs: c, marginPct: m, price: c * (1 + m / 100) };
+}
+
+// Totals for one specialty-handling builder. Margin inherits the global margin unless overridden
+// (0 = comped). Returns COGS, customer price, and per-line marked-up shares for itemized display.
+// Display mode never changes `price` — only whether the customer sees one line or the breakdown.
+function specialtyBuilderTotals(builder, globalMarginPct = 0) {
+  const inherited = builder.marginPct == null;
+  const marginPct = inherited ? sNum(globalMarginPct) : sNum(builder.marginPct);
+  const lines = (builder.lines || []).map(l => {
+    const lineCogs = sNum(l.cost) * sNum(l.times || 1);
+    return {
+      id: l.id, label: l.label, note: l.note, noteToQuote: l.noteToQuote !== false,
+      cogs: lineCogs, price: lineCogs * (1 + marginPct / 100),
+    };
+  });
+  const cogs = lines.reduce((s, l) => s + l.cogs, 0);
+  const price = lines.reduce((s, l) => s + l.price, 0);
+  return { id: builder.id, name: builder.name, display: builder.display || "consolidated",
+           marginPct, marginInherited: inherited, cogs, price, lines };
+}
 
 // Calculate storage schedule from item arrival/departure dates
 // itemHalos: { [itemId]: pct } — per-item halo overrides; globalHalo: fallback %
