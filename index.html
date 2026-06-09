@@ -428,12 +428,11 @@ const blankHandling = () => ({
 });
 
 // ── Phase 0: specialty (cost-plus) handling ──
-// A specialty builder is COGS entered by Procurement, assigned to one or more items,
-// carrying its OWN margin (defaults to the project/global margin). Because it has its own
-// margin it is EXCLUDED from the global-margin base — never double-marked-up.
-// Display is purely cosmetic: "consolidated" shows one line at the full marked-up total;
-// "itemized" shows each piece at its marked-up share. The customer total is identical either
-// way, and COGS is never shown to the customer.
+// COGS entered by Procurement, assigned to one or more items, carrying its OWN margin
+// (defaults to the project/global margin). Because it has its own margin it is EXCLUDED from
+// the global-margin base — never double-marked-up. Display "consolidated" shows one line at the
+// full marked-up total; "itemized" shows each piece at its marked-up share. Customer total is
+// identical either way; COGS is never shown to the customer.
 const blankSpecialtyLine = () => ({
   id: genRowId(),
   label: "",          // free text — "Crane", "150-ton crane", "rigging crew", "per diem"… never hardcoded
@@ -2353,13 +2352,12 @@ function CityAutocomplete({ city, state, lat, lng, international, disabled, onCh
             </div>
           )}
         </div>
-        {/* State badge — auto-filled from selection, read-only display */}
-        {state && !intl && (
-          <div style={{
-            padding:"0 12px", display:"flex", alignItems:"center",
-            background:"var(--bg-2)", border:"1px solid var(--border)", borderRadius:3,
-            fontSize:13, fontWeight:600, color:"var(--accent)", minWidth:48, justifyContent:"center",
-          }}>{state}</div>
+        {/* State — auto-fills from city selection, but stays editable so progression never blocks */}
+        {!intl && (
+          <input className="input input-mono" value={state || ""} disabled={disabled}
+            onChange={e => onChange({ city: query, state: e.target.value.toUpperCase().slice(0, 2), lat, lng, international: intl })}
+            placeholder="ST" maxLength={2}
+            style={{ width: 60, textAlign: "center", fontWeight: 600, color: "var(--accent)" }} />
         )}
       </div>
       {!disabled && (
@@ -2375,6 +2373,33 @@ function CityAutocomplete({ city, state, lat, lng, international, disabled, onCh
 // ============================================================
 // CSR REQUEST FORM
 // ============================================================
+// Side-drawer: slides from the right, holds a focused editor. Reused for customer + items.
+function Drawer({ open, onClose, title, width = 540, children }) {
+  if (!open) return null;
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.5)", zIndex: 180, display: "flex", justifyContent: "flex-end" }}>
+      <div onClick={e => e.stopPropagation()} className="fade-in" style={{ width, maxWidth: "94vw", height: "100%", background: "var(--panel)", borderLeft: "1px solid var(--border-mid)", display: "flex", flexDirection: "column" }}>
+        <div style={{ flexShrink: 0, background: "var(--panel)", borderBottom: "1px solid var(--border)", padding: "15px 20px", display: "flex", alignItems: "center", gap: 10 }}>
+          <div className="eyebrow-bright" style={{ flex: 1 }}>{title}</div>
+          <button className="btn btn-ghost btn-xs" onClick={onClose}><X size={13} /> Done</button>
+        </div>
+        <div style={{ padding: 20, overflowY: "auto", flex: 1 }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+// Read-only labelled value for the calm document view.
+function SummaryStat({ label, value, placeholder = "Not set" }) {
+  const has = value !== null && value !== undefined && String(value).trim() !== "";
+  return (
+    <div>
+      <div className="field-label" style={{ marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 14, color: has ? "var(--text)" : "var(--text-faint)" }}>{has ? value : placeholder}</div>
+    </div>
+  );
+}
+
 function CSRForm({ request, onSaveDraft, onSubmit, onBack, readOnly, role, userName, onAddNote, onAddAttachments, onRemoveAttachment, onDelete, allRequests, onUpdateId, isAdmin }) {
   const [data, setData] = useState({
     locationLat: null, locationLng: null, locationInternational: false,
@@ -2417,9 +2442,16 @@ function CSRForm({ request, onSaveDraft, onSubmit, onBack, readOnly, role, userN
     if (!data.locationInternational && !data.locationState) errs.push("Preferred state");
     if (!submitter.trim()) errs.push("Your name");
     data.items.forEach((it, i) => {
-      if (!it.name.trim() || !it.arrivalDate || !it.quantity || !it.dimL || !it.dimW || !it.dimH || !it.weight) {
-        errs.push(`Item ${i + 1} is incomplete`);
+      const miss = [];
+      if (!it.name.trim()) miss.push("name");
+      if (!it.arrivalDate) miss.push("arrival date");
+      if (!it.quantity) miss.push("quantity");
+      if (it.pricingMode === "flat") {
+        if (!it.flatRate) miss.push("monthly rate");
+      } else if (!it.dimL || !it.dimW || !it.dimH) {
+        miss.push("dimensions");
       }
+      if (miss.length) errs.push(`Item ${i + 1}: ${miss.join(", ")}`);
     });
     return errs;
   };
@@ -2431,6 +2463,35 @@ function CSRForm({ request, onSaveDraft, onSubmit, onBack, readOnly, role, userN
     ...data,
     submittedBy: submitter,
   });
+
+  // Soft submit: always allowed; stamps whether it went in complete or not.
+  const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
+  const doSubmit = (complete) => onSubmit({ ...buildPayload(), submissionComplete: complete }, customId);
+
+  // Document/drawer: which editor is open.
+  const [customerOpen, setCustomerOpen] = useState(false);
+  const [openItem, setOpenItem] = useState(null);
+  const addAndOpen = () => { const it = blankItem(); setData(d => ({ ...d, items: [...d.items, it] })); setOpenItem(it.id); };
+
+  // Quote readiness — counts only the quote-critical fields (same criteria as validate).
+  const readiness = (() => {
+    const checks = [
+      !!data.customerName.trim(),
+      !!data.storageStartDate,
+      !!data.storageEndDate,
+      !!data.locationCity.trim(),
+      !!(data.locationInternational || data.locationState),
+      !!submitter.trim(),
+    ];
+    data.items.forEach(it => {
+      checks.push(
+        !!it.name.trim(), !!it.arrivalDate, !!it.quantity,
+        it.pricingMode === "flat" ? !!it.flatRate : !!(it.dimL && it.dimW && it.dimH),
+      );
+    });
+    const total = checks.length, done = checks.filter(Boolean).length;
+    return { total, done, pct: total ? Math.round((done / total) * 100) : 100 };
+  })();
 
   return (
     <div className="fade-in" style={{ padding: "32px 28px", maxWidth: 1100, margin: "0 auto" }}>
@@ -2511,7 +2572,131 @@ function CSRForm({ request, onSaveDraft, onSubmit, onBack, readOnly, role, userN
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr", gap: 14 }}>
-          <div>
+          <SummaryStat label="Customer" value={data.customerName} />
+          <SummaryStat label="Storage Start" value={data.storageStartDate} placeholder="—" />
+          <SummaryStat label="Storage End" value={data.storageEndDate} placeholder="—" />
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14, marginTop: 14 }}>
+          <SummaryStat label="Preferred Location" value={data.locationCity ? `${data.locationCity}${data.locationState ? ", " + data.locationState : ""}` : ""} />
+          <SummaryStat label="Submitter" value={submitter} placeholder="—" />
+        </div>
+        {!readOnly && (
+          <button className="btn btn-xs" style={{ marginTop: 16 }} onClick={() => setCustomerOpen(true)}>
+            <Edit3 size={12} /> Edit details
+          </button>
+        )}
+      </div>
+
+      {/* Items */}
+      <div className="panel" style={{ padding: 20, marginBottom: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+          <Package size={15} style={{ color: "var(--accent)" }} />
+          <div className="eyebrow-bright">Item Breakdown</div>
+          <div style={{ flex: 1 }} />
+          <span className="font-mono" style={{ fontSize: 11.5, color: "var(--text-dim)" }}>
+            {data.items.length} {data.items.length === 1 ? "item" : "items"}
+          </span>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {data.items.map((it) => {
+            const itemOk = !!it.name.trim() && !!it.arrivalDate && !!it.quantity &&
+              (it.pricingMode === "flat" ? !!it.flatRate : !!(it.dimL && it.dimW && it.dimH));
+            const facts = [];
+            if (it.quantity) facts.push(`${it.quantity} units`);
+            if (it.pricingMode === "flat") { if (it.flatRate) facts.push(`$${it.flatRate}/mo`); }
+            else if (it.dimL && it.dimW && it.dimH) facts.push(`${it.dimL}×${it.dimW}×${it.dimH}`);
+            if (it.arrivalDate) facts.push(it.expectedDeparture ? `${it.arrivalDate} → ${it.expectedDeparture}` : `from ${it.arrivalDate}`);
+            return (
+              <button key={it.id} onClick={() => setOpenItem(it.id)}
+                style={{ width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", background: "var(--bg-2)", border: "1px solid var(--border)", borderRadius: 8, cursor: "pointer", font: "inherit", color: "var(--text)" }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 500, color: it.name.trim() ? "var(--text)" : "var(--text-faint)" }}>
+                    {it.name.trim() || "Untitled item"}
+                  </div>
+                  <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {facts.length ? facts.join("  ·  ") : "No details yet"}
+                  </div>
+                </div>
+                <span style={{ fontSize: 10.5, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".05em", padding: "3px 8px", borderRadius: 20, color: itemOk ? "var(--accent)" : "var(--warning)", background: itemOk ? "rgba(232,184,78,.1)" : "rgba(232,155,111,.1)" }}>
+                  {itemOk ? "Ready" : "Needs info"}
+                </span>
+                <ChevronRight size={15} style={{ color: "var(--text-faint)", flexShrink: 0 }} />
+              </button>
+            );
+          })}
+        </div>
+
+        {!readOnly && (
+          <button className="btn btn-xs" style={{ marginTop: 12 }} onClick={addAndOpen}>
+            <Plus size={12} /> Add item
+          </button>
+        )}
+      </div>
+
+      {/* Quote readiness — honest gauge, doubles as the what's-open list */}
+      {!readOnly && (
+        <div className="panel-inset" style={{ padding: "12px 16px", marginBottom: 14, borderColor: readiness.done === readiness.total ? "var(--border)" : "var(--warning-dim)" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <div style={{ fontSize: 11, color: "var(--text-mid)", fontWeight: 600, textTransform: "uppercase", letterSpacing: ".07em" }}>Quote readiness</div>
+            <div style={{ fontSize: 12, color: "var(--text-dim)" }}>{readiness.done} of {readiness.total} ready</div>
+          </div>
+          <div style={{ height: 5, borderRadius: 3, background: "var(--bg-2)", overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${readiness.pct}%`, background: readiness.done === readiness.total ? "var(--accent)" : "var(--warning)", transition: "width .25s" }} />
+          </div>
+          {errors.length > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontSize: 11, color: "var(--text-mid)", marginBottom: 3, textTransform: "uppercase", letterSpacing: ".05em" }}>Still open</div>
+              <div style={{ fontSize: 12, color: "var(--text-dim)" }}>
+                {errors.slice(0, 5).join(" · ")}{errors.length > 5 ? ` · +${errors.length - 5} more` : ""}
+              </div>
+              <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 6 }}>
+                You can submit as-is, or <span className="kbd">Save Draft</span> to keep working.
+              </div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 8 }}>Everything needed is filled in — ready to submit.</div>
+          )}
+        </div>
+      )}
+
+      {/* Actions */}
+      {!readOnly && (
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", paddingTop: 8 }}>
+          <button className="btn" onClick={() => onSaveDraft(buildPayload(), customId)}>
+            <Save size={14} /> Save Draft
+          </button>
+          <button className="btn btn-primary" onClick={() => errors.length === 0 ? doSubmit(true) : setShowSubmitConfirm(true)}>
+            Submit to Procurement <Send size={14} />
+          </button>
+        </div>
+      )}
+
+      {showSubmitConfirm && (
+        <div onClick={() => setShowSubmitConfirm(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: 20 }}>
+          <div onClick={e => e.stopPropagation()} className="panel" style={{ maxWidth: 440, width: "100%", padding: 22 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 10 }}>
+              <AlertTriangle size={17} style={{ color: "var(--warning)" }} />
+              <div style={{ fontSize: 15, fontWeight: 600 }}>Submit with details still open?</div>
+            </div>
+            <div style={{ fontSize: 12.5, color: "var(--text-mid)", marginBottom: 6 }}>This request is still missing:</div>
+            <div style={{ fontSize: 12.5, color: "var(--text-dim)", marginBottom: 12, lineHeight: 1.5 }}>
+              {errors.slice(0, 6).join(" · ")}{errors.length > 6 ? ` · +${errors.length - 6} more` : ""}
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text-dim)", marginBottom: 16 }}>
+              Procurement will see it's incomplete. For anything unusual or special pricing, reach out to Pricing directly.
+            </div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <button className="btn btn-ghost" onClick={() => setShowSubmitConfirm(false)}>Keep editing</button>
+              <button className="btn btn-primary" onClick={() => { setShowSubmitConfirm(false); doSubmit(false); }}>Submit anyway <Send size={14} /></button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <Drawer open={customerOpen && !readOnly} onClose={() => setCustomerOpen(false)} title="Customer & Engagement">
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <div style={{ gridColumn: "1 / -1" }}>
             <div className="field-label field-label-required">Customer Name</div>
             <input className="input" value={data.customerName} disabled={readOnly}
               onChange={e => handleCustomerNameChange(e.target.value)}
@@ -2527,96 +2712,125 @@ function CSRForm({ request, onSaveDraft, onSubmit, onBack, readOnly, role, userN
             <input type="date" className="input input-mono" value={data.storageEndDate} disabled={readOnly}
               onChange={e => setField("storageEndDate", e.target.value)} />
           </div>
-        </div>
-
-        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14, marginTop: 14 }}>
-          <div>
+          <div style={{ gridColumn: "1 / -1" }}>
             <div className="field-label field-label-required">Preferred Storage Location</div>
             <CityAutocomplete
-              city={data.locationCity}
-              state={data.locationState}
-              lat={data.locationLat}
-              lng={data.locationLng}
-              international={data.locationInternational}
-              disabled={readOnly}
+              city={data.locationCity} state={data.locationState} lat={data.locationLat} lng={data.locationLng}
+              international={data.locationInternational} disabled={readOnly}
               onChange={({ city, state, lat, lng, international }) => {
                 setData(d => ({ ...d, locationCity: city, locationState: state, locationLat: lat, locationLng: lng, locationInternational: international }));
-              }}
-            />
+              }} />
           </div>
-          <div>
+          <div style={{ gridColumn: "1 / -1" }}>
             <div className="field-label field-label-required">Your Name (Submitter)</div>
-            <input className="input" value={submitter} disabled
-              placeholder="e.g. Jane Doe" />
+            <input className="input" value={submitter} disabled placeholder="e.g. Jane Doe" />
           </div>
         </div>
-      </div>
+      </Drawer>
 
-      {/* Items */}
-      <div className="panel" style={{ padding: 20, marginBottom: 18 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
-          <Package size={15} style={{ color: "var(--accent)" }} />
-          <div className="eyebrow-bright">Item Breakdown</div>
-          <div style={{ flex: 1 }} />
-          <span className="font-mono" style={{ fontSize: 11.5, color: "var(--text-dim)" }}>
-            {data.items.length} {data.items.length === 1 ? "item" : "items"}
-          </span>
-        </div>
-
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {data.items.map((it, idx) => (
+      <Drawer open={!!openItem && !readOnly} onClose={() => setOpenItem(null)} title="Edit Item">
+        {(() => {
+          const it = data.items.find(x => x.id === openItem);
+          if (!it) return null;
+          return (
             <ItemCard
-              key={it.id}
               item={it}
-              index={idx}
+              index={data.items.findIndex(x => x.id === openItem)}
               onChange={(patch) => setItem(it.id, patch)}
-              onRemove={() => removeItem(it.id)}
+              onRemove={() => { removeItem(it.id); setOpenItem(null); }}
               canRemove={data.items.length > 1}
               readOnly={readOnly}
             />
-          ))}
-        </div>
-
-        {!readOnly && (
-          <button className="btn btn-xs" style={{ marginTop: 12 }} onClick={addItem}>
-            <Plus size={12} /> Add item
-          </button>
-        )}
-      </div>
-
-      {/* Errors */}
-      {!readOnly && errors.length > 0 && (
-        <div className="panel-inset" style={{ padding: "12px 16px", marginBottom: 14, display: "flex", gap: 10, alignItems: "flex-start", borderColor: "var(--warning-dim)" }}>
-          <AlertTriangle size={15} style={{ color: "var(--warning)", flexShrink: 0, marginTop: 1 }} />
-          <div>
-            <div style={{ fontSize: 12.5, color: "var(--warning)", fontWeight: 500, marginBottom: 4 }}>
-              {errors.length} field{errors.length === 1 ? "" : "s"} still needed to submit
-            </div>
-            <div style={{ fontSize: 12, color: "var(--text-mid)" }}>
-              {errors.slice(0, 4).join(" · ")}{errors.length > 4 ? ` · +${errors.length - 4} more` : ""}
-            </div>
-            <div style={{ fontSize: 11.5, color: "var(--text-dim)", marginTop: 6 }}>
-              You can still <span className="kbd">Save Draft</span> to keep your progress.
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Actions */}
-      {!readOnly && (
-        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", paddingTop: 8 }}>
-          <button className="btn" onClick={() => onSaveDraft(buildPayload(), customId)}>
-            <Save size={14} /> Save Draft
-          </button>
-          <button className="btn btn-primary" onClick={() => onSubmit(buildPayload(), customId)} disabled={!canSubmit}>
-            Submit to Procurement <Send size={14} />
-          </button>
-        </div>
-      )}
+          );
+        })()}
+      </Drawer>
 
       <SharedAttachments request={request} userName={userName} role={role} onAdd={onAddAttachments} onRemove={onRemoveAttachment} />
       <SharedNotesPanel request={request} role={role} userName={userName} onAddNote={onAddNote} />
       <ChangeLogPanel request={request} />
+    </div>
+  );
+}
+
+// Phase 1: per-item monthly movement schedule (drawdown). CSR enters inbound/outbound per
+// month; billable auto-computes via the Phase 0 rule (peak first/last, net middle). Stored on
+// item.movementSchedule; null = simple model (full qty in at arrival, out at departure).
+function MovementScheduleEditor({ item, onChange, readOnly }) {
+  const months = monthRangeKeys(item.arrivalDate, item.expectedDeparture);
+  const hasSched = Array.isArray(item.movementSchedule) && item.movementSchedule.length > 0;
+
+  const seed = () => months.map((m, i) => ({
+    month: m.key,
+    inbound: i === 0 ? (item.quantity || "") : "",
+    outbound: i === months.length - 1 ? (item.quantity || "") : "",
+    billableOverride: null, modified: false,
+  }));
+  const enable = () => onChange({ movementSchedule: seed() });
+  const disable = () => onChange({ movementSchedule: null });
+  const setRow = (key, patch) => onChange({
+    movementSchedule: item.movementSchedule.map(r => r.month === key ? { ...r, ...patch } : r),
+  });
+
+  const billedBy = {};
+  if (hasSched) computeItemBilling(item.movementSchedule).forEach(b => { billedBy[b.key] = b.billable; });
+  const schedMatchesDates = hasSched && item.movementSchedule.length === months.length &&
+    item.movementSchedule.every((r, i) => months[i] && r.month === months[i].key);
+
+  if (!months.length) {
+    return (
+      <div style={{ marginTop: 14, fontSize: 11.5, color: "var(--text-faint)", fontStyle: "italic" }}>
+        Set arrival and departure dates to build a month-by-month movement schedule.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 14, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div className="field-label" style={{ marginBottom: 0 }}>Monthly Movement Schedule</div>
+        <span style={{ fontSize: 11, color: "var(--text-faint)" }}>
+          {hasSched ? "Detailed — billed by the drawdown rule" : "Simple — full quantity in at arrival, out at departure"}
+        </span>
+        <div style={{ flex: 1 }} />
+        {!readOnly && (hasSched
+          ? <button type="button" className="btn btn-ghost btn-xs" onClick={disable}>Use simple</button>
+          : <button type="button" className="btn btn-xs" onClick={enable}><Plus size={12} /> Add schedule</button>)}
+      </div>
+
+      {hasSched && (
+        <div style={{ marginTop: 10 }}>
+          {!schedMatchesDates && !readOnly && (
+            <div style={{ fontSize: 11, color: "var(--warning)", marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
+              Dates changed since this schedule was built.
+              <button type="button" className="btn btn-ghost btn-xs" onClick={enable}>Rebuild from dates</button>
+            </div>
+          )}
+          <div style={{ border: "1px solid var(--border)", borderRadius: 5, overflow: "hidden" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 0.9fr", background: "var(--panel-hi)" }}>
+              {["Month", "Inbound", "Outbound", "Billable"].map((h, i) => (
+                <div key={h} style={{ padding: "6px 10px", fontSize: 9.5, textTransform: "uppercase", letterSpacing: ".08em", color: "var(--text-mid)", fontWeight: 600, textAlign: i === 0 ? "left" : "right" }}>{h}</div>
+              ))}
+            </div>
+            {item.movementSchedule.map(r => (
+              <div key={r.month} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 0.9fr", borderTop: "1px solid var(--border)", alignItems: "center" }}>
+                <div style={{ padding: "6px 10px", fontSize: 12 }}>{monthMeta(r.month).label}</div>
+                <div style={{ padding: "4px 6px" }}>
+                  <input type="number" min="0" className="input input-mono input-no-spin" value={r.inbound} disabled={readOnly}
+                    onChange={e => setRow(r.month, { inbound: e.target.value })} style={{ textAlign: "right", padding: "5px 8px" }} placeholder="0" />
+                </div>
+                <div style={{ padding: "4px 6px" }}>
+                  <input type="number" min="0" className="input input-mono input-no-spin" value={r.outbound} disabled={readOnly}
+                    onChange={e => setRow(r.month, { outbound: e.target.value })} style={{ textAlign: "right", padding: "5px 8px" }} placeholder="0" />
+                </div>
+                <div style={{ padding: "6px 10px", fontSize: 12, textAlign: "right", fontFamily: "'Geist Mono', monospace", color: "var(--accent)" }}>{fmtNum(billedBy[r.month] || 0)}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 6 }}>
+            Billable is auto-calculated: peak for the first &amp; last month, net on-hand for middle months. Departures never reduce first/last-month billing.
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2676,7 +2890,23 @@ function ItemCard({ item, index, onChange, onRemove, canRemove, readOnly }) {
               onChange={e => onChange({ name: e.target.value })}
               placeholder="e.g. Industrial Generator, Pallet of Widgets, Steel Racks" />
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr", gap: 12 }}>
+          {/* Phase 1: pricing mode */}
+          <div style={{ marginBottom: 12 }}>
+            <div className="field-label">How this item is priced</div>
+            <div style={{ display: "inline-flex", gap: 3, padding: 3, border: "1px solid var(--border-mid)", borderRadius: 7, background: "var(--bg-2)" }}>
+              {[["dimensional", "By dimensions"], ["flat", "Flat monthly rate"]].map(([mode, label]) => (
+                <button key={mode} type="button" disabled={readOnly}
+                  onClick={() => onChange({ pricingMode: mode })}
+                  style={{
+                    font: "inherit", fontSize: 11.5, cursor: readOnly ? "default" : "pointer",
+                    padding: "5px 12px", borderRadius: 5, border: "none",
+                    background: (item.pricingMode || "dimensional") === mode ? "var(--panel-hi)" : "transparent",
+                    color: (item.pricingMode || "dimensional") === mode ? "var(--text)" : "var(--text-dim)",
+                  }}>{label}</button>
+              ))}
+            </div>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12 }}>
             <div>
               <div className="field-label field-label-required">Arrival Date</div>
               <input type="date" className="input input-mono" value={item.arrivalDate} disabled={readOnly}
@@ -2697,28 +2927,21 @@ function ItemCard({ item, index, onChange, onRemove, canRemove, readOnly }) {
               </select>
             </div>
             <div>
-              <div className="field-label">Handling Required (Inbound)</div>
-              <select className="select" value={item.handlingRequired || ""} disabled={readOnly}
-                onChange={e => onChange({ handlingRequired: e.target.value })}>
-                <option value="">None / TBD</option>
-                {EQUIPMENT_PRESETS.map(eq => <option key={eq} value={eq}>{eq}</option>)}
-              </select>
-            </div>
-            <div>
               <div className="field-label field-label-required">Quantity</div>
               <input type="number" min="0" className="input input-mono" value={item.quantity} disabled={readOnly}
                 onChange={e => onChange({ quantity: e.target.value })} placeholder="0" />
             </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginTop: 12 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
             <div>
-              <div className="field-label">Handling Required (Outbound)</div>
-              <select className="select" value={item.outboundHandling || item.handlingRequired || ""} disabled={readOnly}
-                onChange={e => onChange({ outboundHandling: e.target.value })}>
-                <option value="">Same as Inbound</option>
+              <div className="field-label">Handling Equipment</div>
+              <select className="select" value={item.handlingRequired || ""} disabled={readOnly}
+                onChange={e => onChange({ handlingRequired: e.target.value, outboundHandling: e.target.value })}>
+                <option value="">None / TBD</option>
                 {EQUIPMENT_PRESETS.map(eq => <option key={eq} value={eq}>{eq}</option>)}
               </select>
+              <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 3 }}>Used for both inbound and outbound</div>
             </div>
             <div>
               <div className="field-label">Items per Shipment</div>
@@ -2729,7 +2952,22 @@ function ItemCard({ item, index, onChange, onRemove, canRemove, readOnly }) {
             </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "3fr 1fr 1fr", gap: 12, marginTop: 12 }}>
+          {(item.pricingMode === "flat") ? (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
+              <div>
+                <div className="field-label field-label-required">Monthly Storage Cost / Unit <span style={{ color: "var(--text-faint)", fontWeight: 400, letterSpacing: 0 }}>(COGS)</span></div>
+                <input type="number" min="0" step="0.01" className="input input-mono" value={item.flatRate || ""} disabled={readOnly}
+                  onChange={e => onChange({ flatRate: e.target.value })} placeholder="$ / unit / month" />
+                <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 3 }}>A cost — Finance applies margin.</div>
+              </div>
+              <div>
+                <div className="field-label">Value per Unit <span style={{ color: "var(--text-faint)", fontWeight: 400, letterSpacing: 0 }}>(USD)</span></div>
+                <input type="number" min="0" step="0.01" className="input input-mono" value={item.value} disabled={readOnly}
+                  onChange={e => onChange({ value: e.target.value })} placeholder="0.00" />
+              </div>
+            </div>
+          ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "3fr 1fr 1fr", gap: 12, marginTop: 12, alignItems: "end" }}>
             <div>
               <div className="field-label field-label-required">Dimensions per Unit (inches) <span style={{ color: "var(--text-faint)", fontWeight: 400, letterSpacing: 0 }}>L × W × H</span></div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
@@ -2742,7 +2980,7 @@ function ItemCard({ item, index, onChange, onRemove, canRemove, readOnly }) {
               </div>
             </div>
             <div>
-              <div className="field-label field-label-required">Weight <span style={{ color: "var(--text-faint)", fontWeight: 400, letterSpacing: 0 }}>(lb)</span></div>
+              <div className="field-label">Weight <span style={{ color: "var(--text-faint)", fontWeight: 400, letterSpacing: 0 }}>(lb)</span></div>
               <input type="number" min="0" className="input input-mono" value={item.weight} disabled={readOnly}
                 onChange={e => onChange({ weight: e.target.value })} placeholder="0" />
             </div>
@@ -2752,6 +2990,7 @@ function ItemCard({ item, index, onChange, onRemove, canRemove, readOnly }) {
                 onChange={e => onChange({ value: e.target.value })} placeholder="0.00" />
             </div>
           </div>
+          )}
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
             <div>
@@ -2808,6 +3047,8 @@ function ItemCard({ item, index, onChange, onRemove, canRemove, readOnly }) {
                 placeholder="e.g. climate controlled, no direct sunlight, rack vs floor, segregate from X…" />
             </div>
           </div>
+
+          <MovementScheduleEditor item={item} onChange={onChange} readOnly={readOnly} />
 
           {fp !== null && (
             <div style={{
@@ -6241,11 +6482,8 @@ function RequestDetail({ request: rawRequest, role, onBack, onUpdate, onDelete, 
 // builder / PDF in Phase 3.
 // ============================================================
 
-// Numeric coercion that treats blanks/garbage as 0.
 const sNum = (x) => { const v = parseFloat(x); return isNaN(v) ? 0 : v; };
 
-// Inclusive month range between two dates — mirrors V1's iteration exactly (noon anchor,
-// year<2000 guard) so the two paths stay consistent.
 function monthRangeKeys(startDate, endDate) {
   if (!startDate || !endDate) return [];
   const a = new Date(startDate + "T12:00:00");
@@ -6266,17 +6504,14 @@ function monthRangeKeys(startDate, endDate) {
   return out;
 }
 
-// Label/sort for a "YYYY-MM" key.
 function monthMeta(key) {
   const [y, m] = String(key).split("-").map(Number);
   const d = new Date(y, (m || 1) - 1, 1);
   return { label: d.toLocaleDateString("en-US", { month: "long", year: "numeric" }), sort: d.getTime() };
 }
 
-// Ordered per-month movement rows for an item.
-//  - Detailed: item.movementSchedule (CSR-entered in/out + optional finance override).
-//  - Simple (schedule null/empty): full qty in at the arrival month, out at the departure
-//    month — which makes the engine bill full qty EVERY month, matching today's behavior.
+// Ordered per-month movement rows. Detailed: item.movementSchedule. Simple: full qty in at
+// arrival month, out at departure month — which bills full qty every month (matches V1).
 function itemMovementMonths(item) {
   const sched = item && Array.isArray(item.movementSchedule) ? item.movementSchedule : null;
   if (sched && sched.length) {
@@ -6301,9 +6536,8 @@ function itemMovementMonths(item) {
   }));
 }
 
-// THE billing rule (validated against the 30/40/40 walkthrough): peak (startOnHand+inbound,
-// departures ignored) for first & last month; net end-of-month for middle months; true net
-// carried forward; a finance override replaces the BILLED number but never the carry math.
+// THE billing rule: peak (startOnHand + inbound) for first & last month, net end-of-month for
+// middle months, true net carried forward; a finance override replaces the BILLED number only.
 function computeItemBilling(months) {
   const n = months.length;
   let onHand = 0;
@@ -6328,22 +6562,18 @@ function computeItemBilling(months) {
   return out;
 }
 
-// Per-item billable-units timeline, tagged with the item's storage type ("either" -> indoor, as V1).
 function itemBillableByMonth(item) {
   const type = (item && item.storageType === "outdoor") ? "outdoor" : "indoor";
   return computeItemBilling(itemMovementMonths(item)).map(m => ({ ...m, storageType: type }));
 }
 
-// Halo-adjusted footprint of one unit (ft²) for a dimensional item.
 function perUnitHaloSqft(item, haloPct) {
   const mult = 1 + sNum(haloPct) / 100;
   return (sNum(item.dimL) * mult) * (sNum(item.dimW) * mult) / 144;
 }
 
-// V2 storage schedule: simple + detailed, dimensional + flat, split by type. Rows carry BOTH
-// sqft (dimensional, billed at the per-type rate) and flatCost (flat items, a direct COGS).
-// For a quote of only simple dimensional items, sqft/month is identical to V1.
-// Phase 3 storageCost = Σ sqft×rate + Σ flatCost.
+// V2 storage schedule: simple + detailed, dimensional + flat, split by type. Rows carry sqft
+// (dimensional) and flatCost (flat). For simple dimensional quotes, sqft/month == V1.
 function buildStorageScheduleV2(items, globalHalo = 0, itemHalos = {}) {
   const buckets = { indoor: {}, outdoor: {} };
   (items || []).forEach(item => {
@@ -6366,30 +6596,23 @@ function buildStorageScheduleV2(items, globalHalo = 0, itemHalos = {}) {
   return [...indoorRows, ...outdoorRows].sort((a, b) => a.sort - b.sort || (a.storageType === "indoor" ? -1 : 1));
 }
 
-// Per-month handling events for an item in a direction (qty moved that month). Phase 1/3 price
-// these against procurement rates — one billable handling instance per month with movement.
 function itemHandlingEvents(item, direction) {
   return itemBillableByMonth(item)
     .map(m => ({ key: m.key, label: m.label, sort: m.sort, qty: direction === "inbound" ? m.inbound : m.outbound }))
     .filter(e => e.qty > 0);
 }
 
-// Is this item covered by any specialty-handling builder? (If so, standard handling is suppressed.)
 function itemUsesSpecialty(itemId, specialtyHandling) {
   return (specialtyHandling || []).some(b => Array.isArray(b.itemIds) && b.itemIds.includes(itemId));
 }
 
-// ── Margin-ledger atom: COGS in, margin applied, customer price out ──
-// The persisted ledger (Phase 3) records {cogs, marginPct, price} per element + a project rollup,
-// so every quote is auditable. Never shown to the customer.
+// Margin-ledger atom: COGS in, margin applied, customer price out.
 function priceFromCogs(cogs, marginPct) {
   const c = sNum(cogs), m = sNum(marginPct);
   return { cogs: c, marginPct: m, price: c * (1 + m / 100) };
 }
 
-// Totals for one specialty-handling builder. Margin inherits the global margin unless overridden
-// (0 = comped). Returns COGS, customer price, and per-line marked-up shares for itemized display.
-// Display mode never changes `price` — only whether the customer sees one line or the breakdown.
+// Totals for one specialty-handling builder. Margin inherits global unless overridden (0 = comped).
 function specialtyBuilderTotals(builder, globalMarginPct = 0) {
   const inherited = builder.marginPct == null;
   const marginPct = inherited ? sNum(globalMarginPct) : sNum(builder.marginPct);
